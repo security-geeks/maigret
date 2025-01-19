@@ -5,7 +5,8 @@ Tags
 
 The use of tags allows you to select a subset of the sites from big Maigret DB for search.
 
-**Warning: tags markup is not stable now.**
+.. warning::
+   Tags markup is still not stable.
 
 There are several types of tags:
 
@@ -17,7 +18,7 @@ There are several types of tags:
 
 Usage
 -----
-``--tags en,jp`` -- search on US and Japanese sites (actually marked as such in the Maigret database)
+``--tags us,jp`` -- search on US and Japanese sites (actually marked as such in the Maigret database)
 
 ``--tags coding`` -- search on sites related to software development.
 

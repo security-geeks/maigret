@@ -2,10 +2,11 @@
 
 This module defines various objects for recording the results of queries.
 """
+
 from enum import Enum
 
 
-class QueryStatus(Enum):
+class MaigretCheckStatus(Enum):
     """Query Status Enumeration.
 
     Describes status of query about a given username.
@@ -28,10 +29,9 @@ class QueryStatus(Enum):
         return self.value
 
 
-class QueryResult:
-    """Query Result Object.
-
-    Describes result of query about a given username.
+class MaigretCheckResult:
+    """
+    Describes result of checking a given username on a given site
     """
 
     def __init__(
@@ -46,11 +46,7 @@ class QueryResult:
         error=None,
         tags=[],
     ):
-        """Create Query Result Object.
-
-        Contains information about a specific method of detecting usernames on
-        a given type of web sites.
-
+        """
         Keyword Arguments:
         self                   -- This object.
         username               -- String indicating username that query result
@@ -97,7 +93,10 @@ class QueryResult:
         }
 
     def is_found(self):
-        return self.status == QueryStatus.CLAIMED
+        return self.status == MaigretCheckStatus.CLAIMED
+
+    def __repr__(self):
+        return f"<{self.__str__()}>"
 
     def __str__(self):
         """Convert Object To String.

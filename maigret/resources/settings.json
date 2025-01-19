@@ -1,21 +1,30 @@
 {
     "presence_strings": [
+        "user not found",
+        "404",
+        "Page not found",
+        "error 404",
         "username",
         "not found",
         "пользователь",
         "profile",
         "lastname",
         "firstname",
+        "DisplayName",
         "biography",
+        "title",
         "birthday",
         "репутация",
         "информация",
-        "e-mail"
+        "e-mail",
+        "body",
+        "html",
+        "style"
     ],
     "supposed_usernames": [
         "alex", "god", "admin", "red", "blue", "john"
     ],
-    "retries_count": 1,
+    "retries_count": 0,
     "sites_db_path": "resources/data.json",
     "timeout": 30,
     "max_connections": 100,
@@ -44,5 +53,6 @@
     "xmind_report": false,
     "graph_report": false,
     "pdf_report": false,
-    "html_report": false
+    "html_report": false,
+    "web_interface_port": 5000
 }

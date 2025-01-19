@@ -1,10 +1,13 @@
 """Maigret activation test functions"""
+
 import json
+import yarl
 
 import aiohttp
 import pytest
 from mock import Mock
 
+from tests.conftest import LOCAL_SERVER_PORT
 from maigret.activation import ParsingActivator, import_aiohttp_cookies
 
 COOKIES_TXT = """# HTTP Cookie File downloaded with cookies.txt by Genuinous @genuinous
@@ -18,39 +21,38 @@ xss.is	FALSE	/	TRUE	0	xf_csrf	test
 xss.is	FALSE	/	TRUE	1642709308	xf_user	tset
 .xss.is	TRUE	/	FALSE	0	muchacho_cache	test
 .xss.is	TRUE	/	FALSE	1924905600	132_evc	test
-httpbin.org	FALSE	/	FALSE	0	a	b
+localhost	FALSE	/	FALSE	0	a	b
 """
 
 
-@pytest.mark.skip(reason="periodically fails")
+@pytest.mark.skip("captcha")
 @pytest.mark.slow
-def test_twitter_activation(default_db):
-    twitter_site = default_db.sites_dict['Twitter']
-    token1 = twitter_site.headers['x-guest-token']
+def test_vimeo_activation(default_db):
+    vimeo_site = default_db.sites_dict['Vimeo']
+    token1 = vimeo_site.headers['Authorization']
 
-    ParsingActivator.twitter(twitter_site, Mock())
-    token2 = twitter_site.headers['x-guest-token']
+    ParsingActivator.vimeo(vimeo_site, Mock())
+    token2 = vimeo_site.headers['Authorization']
 
     assert token1 != token2
 
 
+@pytest.mark.slow
 @pytest.mark.asyncio
-async def test_import_aiohttp_cookies():
+async def test_import_aiohttp_cookies(cookie_test_server):
     cookies_filename = 'cookies_test.txt'
     with open(cookies_filename, 'w') as f:
         f.write(COOKIES_TXT)
 
     cookie_jar = import_aiohttp_cookies(cookies_filename)
-    assert list(cookie_jar._cookies.keys()) == ['xss.is', 'httpbin.org']
+    url = f'http://localhost:{LOCAL_SERVER_PORT}/cookies'
 
-    url = 'https://httpbin.org/cookies'
-    connector = aiohttp.TCPConnector(ssl=False)
-    session = aiohttp.ClientSession(
-        connector=connector, trust_env=True, cookie_jar=cookie_jar
-    )
+    cookies = cookie_jar.filter_cookies(yarl.URL(url))
+    assert cookies['a'].value == 'b'
 
-    response = await session.get(url=url)
-    result = json.loads(await response.content.read())
-    await session.close()
+    async with aiohttp.ClientSession(cookie_jar=cookie_jar) as session:
+        async with session.get(url=url) as response:
+            result = await response.json()
+            print(f"Server response: {result}")
 
     assert result == {'cookies': {'a': 'b'}}

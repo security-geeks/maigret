@@ -1,39 +1,36 @@
+# Standard library imports
+import ast
 import asyncio
 import logging
+import random
+import re
+import ssl
+import sys
+from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
+
+# Third party imports
+import aiodns
+from alive_progress import alive_bar
+from aiohttp import ClientSession, TCPConnector, http_exceptions
+from aiohttp.client_exceptions import ClientConnectorError, ServerDisconnectedError
+from python_socks import _errors as proxy_errors
+from socid_extractor import extract
 
 try:
     from mock import Mock
 except ImportError:
     from unittest.mock import Mock
 
-import re
-import ssl
-import sys
-import tqdm
-import random
-from typing import Tuple, Optional, Dict, List
-from urllib.parse import quote
-
-import aiodns
-import tqdm.asyncio
-from python_socks import _errors as proxy_errors
-from socid_extractor import extract
-from aiohttp import TCPConnector, ClientSession, http_exceptions
-from aiohttp.client_exceptions import ServerDisconnectedError, ClientConnectorError
-
-from .activation import ParsingActivator, import_aiohttp_cookies
+# Local imports
 from . import errors
+from .activation import ParsingActivator, import_aiohttp_cookies
 from .errors import CheckError
-from .executors import (
-    AsyncExecutor,
-    AsyncioSimpleExecutor,
-    AsyncioProgressbarQueueExecutor,
-)
-
-from .result import QueryResult, QueryStatus
+from .executors import AsyncioQueueGeneratorExecutor
+from .result import MaigretCheckResult, MaigretCheckStatus
 from .sites import MaigretDatabase, MaigretSite
 from .types import QueryOptions, QueryResultWrapper
-from .utils import get_random_user_agent, ascii_data_display
+from .utils import ascii_data_display, get_random_user_agent
 
 
 SUPPORTED_IDS = (
@@ -57,119 +54,128 @@ class CheckerBase:
 
 class SimpleAiohttpChecker(CheckerBase):
     def __init__(self, *args, **kwargs):
-        proxy = kwargs.get('proxy')
-        cookie_jar = kwargs.get('cookie_jar')
+        self.proxy = kwargs.get('proxy')
+        self.cookie_jar = kwargs.get('cookie_jar')
         self.logger = kwargs.get('logger', Mock())
-
-        # moved here to speed up the launch of Maigret
-        from aiohttp_socks import ProxyConnector
-
-        # make http client session
-        connector = ProxyConnector.from_url(proxy) if proxy else TCPConnector(ssl=False)
-        connector.verify_ssl = False
-        self.session = ClientSession(
-            connector=connector, trust_env=True, cookie_jar=cookie_jar
-        )
+        self.url = None
+        self.headers = None
+        self.allow_redirects = True
+        self.timeout = 0
+        self.method = 'get'
 
     def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get'):
-        if method == 'get':
-            request_method = self.session.get
-        else:
-            request_method = self.session.head
-
-        future = request_method(
-            url=url,
-            headers=headers,
-            allow_redirects=allow_redirects,
-            timeout=timeout,
-        )
-
-        return future
+        self.url = url
+        self.headers = headers
+        self.allow_redirects = allow_redirects
+        self.timeout = timeout
+        self.method = method
+        return None
 
     async def close(self):
-        await self.session.close()
+        pass
 
-    async def check(self, future) -> Tuple[str, int, Optional[CheckError]]:
-        html_text = None
-        status_code = 0
-        error: Optional[CheckError] = CheckError("Unknown")
-
+    async def _make_request(
+        self, session, url, headers, allow_redirects, timeout, method, logger
+    ) -> Tuple[str, int, Optional[CheckError]]:
         try:
-            response = await future
+            request_method = session.get if method == 'get' else session.head
+            async with request_method(
+                url=url,
+                headers=headers,
+                allow_redirects=allow_redirects,
+                timeout=timeout,
+            ) as response:
+                status_code = response.status
+                response_content = await response.content.read()
+                charset = response.charset or "utf-8"
+                decoded_content = response_content.decode(charset, "ignore")
 
-            status_code = response.status
-            response_content = await response.content.read()
-            charset = response.charset or "utf-8"
-            decoded_content = response_content.decode(charset, "ignore")
-            html_text = decoded_content
+                error = CheckError("Connection lost") if status_code == 0 else None
+                logger.debug(decoded_content)
 
-            error = None
-            if status_code == 0:
-                error = CheckError("Connection lost")
-
-            self.logger.debug(html_text)
+                return decoded_content, status_code, error
 
         except asyncio.TimeoutError as e:
-            error = CheckError("Request timeout", str(e))
+            return None, 0, CheckError("Request timeout", str(e))
         except ClientConnectorError as e:
-            error = CheckError("Connecting failure", str(e))
+            return None, 0, CheckError("Connecting failure", str(e))
         except ServerDisconnectedError as e:
-            error = CheckError("Server disconnected", str(e))
+            return None, 0, CheckError("Server disconnected", str(e))
         except http_exceptions.BadHttpMessage as e:
-            error = CheckError("HTTP", str(e))
+            return None, 0, CheckError("HTTP", str(e))
         except proxy_errors.ProxyError as e:
-            error = CheckError("Proxy", str(e))
+            return None, 0, CheckError("Proxy", str(e))
         except KeyboardInterrupt:
-            error = CheckError("Interrupted")
+            return None, 0, CheckError("Interrupted")
         except Exception as e:
-            # python-specific exceptions
             if sys.version_info.minor > 6 and (
                 isinstance(e, ssl.SSLCertVerificationError)
                 or isinstance(e, ssl.SSLError)
             ):
-                error = CheckError("SSL", str(e))
+                return None, 0, CheckError("SSL", str(e))
             else:
-                self.logger.debug(e, exc_info=True)
-                error = CheckError("Unexpected", str(e))
+                logger.debug(e, exc_info=True)
+                return None, 0, CheckError("Unexpected", str(e))
 
-        if error == "Invalid proxy response":
-            self.logger.debug(error, exc_info=True)
+    async def check(self) -> Tuple[str, int, Optional[CheckError]]:
+        from aiohttp_socks import ProxyConnector
 
-        return str(html_text), status_code, error
+        connector = (
+            ProxyConnector.from_url(self.proxy)
+            if self.proxy
+            else TCPConnector(ssl=False)
+        )
+        connector.verify_ssl = False
+
+        async with ClientSession(
+            connector=connector,
+            trust_env=True,
+            # TODO: tests
+            cookie_jar=self.cookie_jar if self.cookie_jar else None,
+        ) as session:
+            html_text, status_code, error = await self._make_request(
+                session,
+                self.url,
+                self.headers,
+                self.allow_redirects,
+                self.timeout,
+                self.method,
+                self.logger,
+            )
+
+            if error and str(error) == "Invalid proxy response":
+                self.logger.debug(error, exc_info=True)
+
+            return str(html_text) if html_text else '', status_code, error
 
 
 class ProxiedAiohttpChecker(SimpleAiohttpChecker):
     def __init__(self, *args, **kwargs):
-        proxy = kwargs.get('proxy')
-        cookie_jar = kwargs.get('cookie_jar')
+        self.proxy = kwargs.get('proxy')
+        self.cookie_jar = kwargs.get('cookie_jar')
         self.logger = kwargs.get('logger', Mock())
-
-        # moved here to speed up the launch of Maigret
-        from aiohttp_socks import ProxyConnector
-
-        connector = ProxyConnector.from_url(proxy)
-        connector.verify_ssl = False
-        self.session = ClientSession(
-            connector=connector, trust_env=True, cookie_jar=cookie_jar
-        )
 
 
 class AiodnsDomainResolver(CheckerBase):
+    if sys.platform == 'win32':  # Temporary workaround for Windows
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
     def __init__(self, *args, **kwargs):
         loop = asyncio.get_event_loop()
         self.logger = kwargs.get('logger', Mock())
         self.resolver = aiodns.DNSResolver(loop=loop)
 
     def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get'):
-        return self.resolver.query(url, 'A')
+        self.url = url
+        return None
 
-    async def check(self, future) -> Tuple[str, int, Optional[CheckError]]:
+    async def check(self) -> Tuple[str, int, Optional[CheckError]]:
         status = 404
         error = None
         text = ''
 
         try:
-            res = await future
+            res = await self.resolver.query(self.url, 'A')
             text = str(res[0].host)
             status = 200
         except aiodns.error.DNSError:
@@ -188,7 +194,7 @@ class CheckerMock:
     def prepare(self, url, headers=None, allow_redirects=True, timeout=0, method='get'):
         return None
 
-    async def check(self, future) -> Tuple[str, int, Optional[CheckError]]:
+    async def check(self) -> Tuple[str, int, Optional[CheckError]]:
         await asyncio.sleep(0)
         return '', 0, None
 
@@ -275,14 +281,16 @@ def process_site_result(
     )
 
     if site.activation and html_text and is_need_activation:
+        logger.debug(f"Activation for {site.name}")
         method = site.activation["method"]
         try:
             activate_fun = getattr(ParsingActivator(), method)
             # TODO: async call
             activate_fun(site, logger)
-        except AttributeError:
+        except AttributeError as e:
             logger.warning(
-                f"Activation method {method} for site {site.name} not found!"
+                f"Activation method {method} for site {site.name} not found!",
+                exc_info=True,
             )
         except Exception as e:
             logger.warning(
@@ -310,7 +318,7 @@ def process_site_result(
                     break
 
     def build_result(status, **kwargs):
-        return QueryResult(
+        return MaigretCheckResult(
             username,
             site_name,
             url,
@@ -322,11 +330,11 @@ def process_site_result(
 
     if check_error:
         logger.warning(check_error)
-        result = QueryResult(
+        result = MaigretCheckResult(
             username,
             site_name,
             url,
-            QueryStatus.UNKNOWN,
+            MaigretCheckStatus.UNKNOWN,
             query_time=response_time,
             error=check_error,
             context=str(CheckError),
@@ -338,15 +346,15 @@ def process_site_result(
             [(absence_flag in html_text) for absence_flag in site.absence_strs]
         )
         if not is_absence_detected and is_presense_detected:
-            result = build_result(QueryStatus.CLAIMED)
+            result = build_result(MaigretCheckStatus.CLAIMED)
         else:
-            result = build_result(QueryStatus.AVAILABLE)
+            result = build_result(MaigretCheckStatus.AVAILABLE)
     elif check_type in "status_code":
         # Checks if the status code of the response is 2XX
         if 200 <= status_code < 300:
-            result = build_result(QueryStatus.CLAIMED)
+            result = build_result(MaigretCheckStatus.CLAIMED)
         else:
-            result = build_result(QueryStatus.AVAILABLE)
+            result = build_result(MaigretCheckStatus.AVAILABLE)
     elif check_type == "response_url":
         # For this detection method, we have turned off the redirect.
         # So, there is no need to check the response URL: it will always
@@ -354,9 +362,9 @@ def process_site_result(
         # code indicates that the request was successful (i.e. no 404, or
         # forward to some odd redirect).
         if 200 <= status_code < 300 and is_presense_detected:
-            result = build_result(QueryStatus.CLAIMED)
+            result = build_result(MaigretCheckStatus.CLAIMED)
         else:
-            result = build_result(QueryStatus.AVAILABLE)
+            result = build_result(MaigretCheckStatus.AVAILABLE)
     else:
         # It should be impossible to ever get here...
         raise ValueError(
@@ -365,25 +373,13 @@ def process_site_result(
 
     extracted_ids_data = {}
 
-    if is_parsing_enabled and result.status == QueryStatus.CLAIMED:
-        try:
-            extracted_ids_data = extract(html_text)
-        except Exception as e:
-            logger.warning(f"Error while parsing {site.name}: {e}", exc_info=True)
-
+    if is_parsing_enabled and result.status == MaigretCheckStatus.CLAIMED:
+        extracted_ids_data = extract_ids_data(html_text, logger, site)
         if extracted_ids_data:
-            new_usernames = {}
-            for k, v in extracted_ids_data.items():
-                if "username" in k:
-                    new_usernames[v] = "username"
-                if k in SUPPORTED_IDS:
-                    new_usernames[v] = k
-
-            results_info["ids_usernames"] = new_usernames
-            links = ascii_data_display(extracted_ids_data.get("links", "[]"))
-            if "website" in extracted_ids_data:
-                links.append(extracted_ids_data["website"])
-            results_info["ids_links"] = links
+            new_usernames = parse_usernames(extracted_ids_data, logger)
+            results_info = update_results_info(
+                results_info, extracted_ids_data, new_usernames
+            )
             result.ids_data = extracted_ids_data
 
     # Save status of request
@@ -415,6 +411,8 @@ def make_site_result(
 
     headers = {
         "User-Agent": get_random_user_agent(),
+        # tell server that we want to close connection after request
+        "Connection": "close",
     }
 
     headers.update(site.headers)
@@ -440,29 +438,29 @@ def make_site_result(
     # site check is disabled
     if site.disabled and not options['forced']:
         logger.debug(f"Site {site.name} is disabled, skipping...")
-        results_site["status"] = QueryResult(
+        results_site["status"] = MaigretCheckResult(
             username,
             site.name,
             url,
-            QueryStatus.ILLEGAL,
+            MaigretCheckStatus.ILLEGAL,
             error=CheckError("Check is disabled"),
         )
     # current username type could not be applied
     elif site.type != options["id_type"]:
-        results_site["status"] = QueryResult(
+        results_site["status"] = MaigretCheckResult(
             username,
             site.name,
             url,
-            QueryStatus.ILLEGAL,
+            MaigretCheckStatus.ILLEGAL,
             error=CheckError('Unsupported identifier type', f'Want "{site.type}"'),
         )
     # username is not allowed.
     elif site.regex_check and re.search(site.regex_check, username) is None:
-        results_site["status"] = QueryResult(
+        results_site["status"] = MaigretCheckResult(
             username,
             site.name,
             url,
-            QueryStatus.ILLEGAL,
+            MaigretCheckStatus.ILLEGAL,
             error=CheckError(
                 'Unsupported username format', f'Want "{site.regex_check}"'
             ),
@@ -521,7 +519,8 @@ def make_site_result(
 
         # Store future request object in the results object
         results_site["future"] = future
-        results_site["checker"] = checker
+
+    results_site["checker"] = checker
 
     return results_site
 
@@ -529,14 +528,19 @@ def make_site_result(
 async def check_site_for_username(
     site, username, options: QueryOptions, logger, query_notify, *args, **kwargs
 ) -> Tuple[str, QueryResultWrapper]:
-    default_result = make_site_result(site, username, options, logger, retry=kwargs.get('retry'))
-    future = default_result.get("future")
-    if not future:
+    default_result = make_site_result(
+        site, username, options, logger, retry=kwargs.get('retry')
+    )
+    # future = default_result.get("future")
+    # if not future:
+    # return site.name, default_result
+
+    checker = default_result.get("checker")
+    if not checker:
+        print(f"error, no checker for {site.name}")
         return site.name, default_result
 
-    checker = default_result["checker"]
-
-    response = await checker.check(future=future)
+    response = await checker.check()
 
     response_result = process_site_result(
         response, query_notify, logger, default_result, site
@@ -548,8 +552,8 @@ async def check_site_for_username(
 
 
 async def debug_ip_request(checker, logger):
-    future = checker.prepare(url="https://icanhazip.com")
-    ip, status, check_error = await checker.check(future)
+    checker.prepare(url="https://icanhazip.com")
+    ip, status, check_error = await checker.check()
     if ip:
         logger.debug(f"My IP is: {ip.strip()}")
     else:
@@ -604,7 +608,7 @@ async def maigret(
     is_parsing_enabled     -- Extract additional info from account pages.
     id_type                -- Type of username to search.
                               Default is 'username', see all supported here:
-                              https://github.com/soxoj/maigret/wiki/Supported-identifier-types
+                              https://maigret.readthedocs.io/en/latest/supported-identifier-types.html
     max_connections        -- Maximum number of concurrent connections allowed.
                               Default is 100.
     no_progressbar         -- Displaying of ASCII progressbar during scanner.
@@ -662,14 +666,13 @@ async def maigret(
         await debug_ip_request(clearweb_checker, logger)
 
     # setup parallel executor
-    executor: Optional[AsyncExecutor] = None
-    if no_progressbar:
-        executor = AsyncioSimpleExecutor(logger=logger)
-    else:
-        executor = AsyncioProgressbarQueueExecutor(
-            logger=logger, in_parallel=max_connections, timeout=timeout + 0.5,
-            *args, **kwargs
-        )
+    executor = AsyncioQueueGeneratorExecutor(
+        logger=logger,
+        in_parallel=max_connections,
+        timeout=timeout + 0.5,
+        *args,
+        **kwargs,
+    )
 
     # make options objects for all the requests
     options: QueryOptions = {}
@@ -699,27 +702,34 @@ async def maigret(
                 continue
             default_result: QueryResultWrapper = {
                 'site': site,
-                'status': QueryResult(
+                'status': MaigretCheckResult(
                     username,
                     sitename,
                     '',
-                    QueryStatus.UNKNOWN,
+                    MaigretCheckStatus.UNKNOWN,
                     error=CheckError('Request failed'),
                 ),
             }
             tasks_dict[sitename] = (
                 check_site_for_username,
                 [site, username, options, logger, query_notify],
-                {'default': (sitename, default_result), 'retry': retries-attempts+1},
+                {
+                    'default': (sitename, default_result),
+                    'retry': retries - attempts + 1,
+                },
             )
 
-        cur_results = await executor.run(tasks_dict.values())
-
-        # wait for executor timeout errors
-        await asyncio.sleep(1)
+        cur_results = []
+        with alive_bar(
+            len(tasks_dict), title="Searching", force_tty=True, disable=no_progressbar
+        ) as progress:
+            async for result in executor.run(tasks_dict.values()):
+                cur_results.append(result)
+                progress()
 
         all_results.update(cur_results)
 
+        # rerun for failed sites
         sites = get_failed_sites(dict(cur_results))
         attempts -= 1
 
@@ -733,10 +743,8 @@ async def maigret(
 
     # closing http client session
     await clearweb_checker.close()
-    if tor_proxy:
-        await tor_checker.close()
-    if i2p_proxy:
-        await i2p_checker.close()
+    await tor_checker.close()
+    await i2p_checker.close()
 
     # notify caller that all queries are finished
     query_notify.finish()
@@ -771,21 +779,23 @@ def timeout_check(value):
 
 async def site_self_check(
     site: MaigretSite,
-    logger,
+    logger: logging.Logger,
     semaphore,
     db: MaigretDatabase,
     silent=False,
     proxy=None,
     tor_proxy=None,
     i2p_proxy=None,
+    skip_errors=False,
+    cookies=None,
 ):
     changes = {
         "disabled": False,
     }
 
     check_data = [
-        (site.username_claimed, QueryStatus.CLAIMED),
-        (site.username_unclaimed, QueryStatus.AVAILABLE),
+        (site.username_claimed, MaigretCheckStatus.CLAIMED),
+        (site.username_unclaimed, MaigretCheckStatus.AVAILABLE),
     ]
 
     logger.info(f"Checking {site.name}...")
@@ -804,6 +814,7 @@ async def site_self_check(
                 proxy=proxy,
                 tor_proxy=tor_proxy,
                 i2p_proxy=i2p_proxy,
+                cookies=cookies,
             )
 
             # don't disable entries with other ids types
@@ -817,19 +828,27 @@ async def site_self_check(
 
             result = results_dict[site.name]["status"]
 
+        if result.error and 'Cannot connect to host' in result.error.desc:
+            changes["disabled"] = True
+
         site_status = result.status
 
         if site_status != status:
-            if site_status == QueryStatus.UNKNOWN:
+            if site_status == MaigretCheckStatus.UNKNOWN:
                 msgs = site.absence_strs
                 etype = site.check_type
                 logger.warning(
                     f"Error while searching {username} in {site.name}: {result.context}, {msgs}, type {etype}"
                 )
+                # don't disable sites after the error
+                # meaning that the site could be available, but returned error for the check
+                # e.g. many sites protected by cloudflare and available in general
+                if skip_errors:
+                    pass
                 # don't disable in case of available username
-                if status == QueryStatus.CLAIMED:
+                elif status == MaigretCheckStatus.CLAIMED:
                     changes["disabled"] = True
-            elif status == QueryStatus.CLAIMED:
+            elif status == MaigretCheckStatus.CLAIMED:
                 logger.warning(
                     f"Not found `{username}` in {site.name}, must be claimed"
                 )
@@ -844,10 +863,16 @@ async def site_self_check(
 
     if changes["disabled"] != site.disabled:
         site.disabled = changes["disabled"]
+        logger.info(f"Switching property 'disabled' for {site.name} to {site.disabled}")
         db.update_site(site)
         if not silent:
             action = "Disabled" if site.disabled else "Enabled"
             print(f"{action} site {site.name}...")
+
+    # remove service tag "unchecked"
+    if "unchecked" in site.tags:
+        site.tags.remove("unchecked")
+        db.update_site(site)
 
     return changes
 
@@ -855,7 +880,7 @@ async def site_self_check(
 async def self_check(
     db: MaigretDatabase,
     site_data: dict,
-    logger,
+    logger: logging.Logger,
     silent=False,
     max_connections=10,
     proxy=None,
@@ -869,31 +894,79 @@ async def self_check(
     def disabled_count(lst):
         return len(list(filter(lambda x: x.disabled, lst)))
 
+    unchecked_old_count = len(
+        [site for site in all_sites.values() if "unchecked" in site.tags]
+    )
     disabled_old_count = disabled_count(all_sites.values())
 
     for _, site in all_sites.items():
         check_coro = site_self_check(
-            site, logger, sem, db, silent, proxy, tor_proxy, i2p_proxy
+            site, logger, sem, db, silent, proxy, tor_proxy, i2p_proxy, skip_errors=True
         )
         future = asyncio.ensure_future(check_coro)
         tasks.append(future)
 
-    for f in tqdm.asyncio.tqdm.as_completed(tasks):
-        await f
+    if tasks:
+        with alive_bar(len(tasks), title='Self-checking', force_tty=True) as progress:
+            for f in asyncio.as_completed(tasks):
+                await f
+                progress()  # Update the progress bar
 
+    unchecked_new_count = len(
+        [site for site in all_sites.values() if "unchecked" in site.tags]
+    )
     disabled_new_count = disabled_count(all_sites.values())
     total_disabled = disabled_new_count - disabled_old_count
 
-    if total_disabled >= 0:
-        message = "Disabled"
-    else:
-        message = "Enabled"
-        total_disabled *= -1
+    if total_disabled:
+        if total_disabled >= 0:
+            message = "Disabled"
+        else:
+            message = "Enabled"
+            total_disabled *= -1
 
-    if not silent:
-        print(
-            f"{message} {total_disabled} ({disabled_old_count} => {disabled_new_count}) checked sites. "
-            "Run with `--info` flag to get more information"
-        )
+        if not silent:
+            print(
+                f"{message} {total_disabled} ({disabled_old_count} => {disabled_new_count}) checked sites. "
+                "Run with `--info` flag to get more information"
+            )
 
-    return total_disabled != 0
+    if unchecked_new_count != unchecked_old_count:
+        print(f"Unchecked sites verified: {unchecked_old_count - unchecked_new_count}")
+
+    return total_disabled != 0 or unchecked_new_count != unchecked_old_count
+
+
+def extract_ids_data(html_text, logger, site) -> Dict:
+    try:
+        return extract(html_text)
+    except Exception as e:
+        logger.warning(f"Error while parsing {site.name}: {e}", exc_info=True)
+        return {}
+
+
+def parse_usernames(extracted_ids_data, logger) -> Dict:
+    new_usernames = {}
+    for k, v in extracted_ids_data.items():
+        if "username" in k and not "usernames" in k:
+            new_usernames[v] = "username"
+        elif "usernames" in k:
+            try:
+                tree = ast.literal_eval(v)
+                if type(tree) == list:
+                    for n in tree:
+                        new_usernames[n] = "username"
+            except Exception as e:
+                logger.warning(e)
+        if k in SUPPORTED_IDS:
+            new_usernames[v] = k
+    return new_usernames
+
+
+def update_results_info(results_info, extracted_ids_data, new_usernames):
+    results_info["ids_usernames"] = new_usernames
+    links = ascii_data_display(extracted_ids_data.get("links", "[]"))
+    if "website" in extracted_ids_data:
+        links.append(extracted_ids_data["website"])
+    results_info["ids_links"] = links
+    return results_info

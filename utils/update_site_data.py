@@ -3,13 +3,12 @@
 This module generates the listing of supported sites in file `SITES.md`
 and pretty prints file with sites data.
 """
-import json
 import sys
 import requests
 import logging
 import threading
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from argparse import ArgumentParser, RawDescriptionHelpFormatter
 
 from maigret.maigret import MaigretDatabase
@@ -27,9 +26,10 @@ RANKS.update({
 
 SEMAPHORE = threading.Semaphore(20)
 
+
 def get_rank(domain_to_query, site, print_errors=True):
     with SEMAPHORE:
-        #Retrieve ranking data via alexa API
+        # Retrieve ranking data via alexa API
         url = f"http://data.alexa.com/data?cli=10&url={domain_to_query}"
         xml_data = requests.get(url).text
         root = ET.fromstring(xml_data)
@@ -67,7 +67,7 @@ def get_step_rank(rank):
         return get_readable_rank(list(filter(lambda x: x >= rank, valid_step_ranks))[0])
 
 
-if __name__ == '__main__':
+def main():
     parser = ArgumentParser(formatter_class=RawDescriptionHelpFormatter
                             )
     parser.add_argument("--base","-b", metavar="BASE_FILE",
@@ -85,6 +85,8 @@ if __name__ == '__main__':
 
     db = MaigretDatabase()
     sites_subset = db.load_from_file(args.base_file).sites
+
+    print(f"\nUpdating supported sites list (don't worry, it's needed)...")
 
     with open("sites.md", "w") as site_file:
         site_file.write(f"""
@@ -137,11 +139,15 @@ Rank data fetched from Alexa by domains.
             site_file.write(f'1. {favicon} [{site}]({url_main})*: top {valid_rank}{tags}*{note}\n')
             db.update_site(site)
 
-        site_file.write(f'\nThe list was updated at ({datetime.utcnow()} UTC)\n')
+        site_file.write(f'\nThe list was updated at ({datetime.now(timezone.utc).date()})\n')
         db.save_to_file(args.base_file)
 
         statistics_text = db.get_db_stats(is_markdown=True)
         site_file.write('## Statistics\n\n')
         site_file.write(statistics_text)
 
-    print("\nFinished updating supported site listing!")
+    print("Finished updating supported site listing!")
+
+
+if __name__ == '__main__':
+    main()

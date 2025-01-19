@@ -3,12 +3,12 @@ import json
 import random
 import re
 
-import tqdm.asyncio
+import alive_progress
 from mock import Mock
 import requests
 
 from maigret.maigret import *
-from maigret.result import QueryStatus
+from maigret.result import MaigretCheckStatus
 from maigret.sites import MaigretSite
 
 URL_RE = re.compile(r"https?://(www\.)?")
@@ -31,7 +31,7 @@ async def maigret_check(site, site_data, username, status, logger):
         )
 
         if results[site]['status'].status != status:
-            if results[site]['status'].status == QueryStatus.UNKNOWN:
+            if results[site]['status'].status == MaigretCheckStatus.UNKNOWN:
                 msg = site_data.absence_strs
                 etype = site_data.check_type
                 context = results[site]['status'].context
@@ -41,7 +41,7 @@ async def maigret_check(site, site_data, username, status, logger):
                 #     continue
                 return False
 
-            if status == QueryStatus.CLAIMED:
+            if status == MaigretCheckStatus.CLAIMED:
                 logger.debug(f'Not found {username} in {site}, must be claimed')
                 logger.debug(results[site])
                 pass
@@ -62,7 +62,7 @@ async def check_and_add_maigret_site(site_data, semaphore, logger, ok_usernames,
 
         for ok_username in ok_usernames:
             site_data.username_claimed = ok_username
-            status = QueryStatus.CLAIMED
+            status = MaigretCheckStatus.CLAIMED
             if await maigret_check(sitename, site_data, ok_username, status, logger):
                 # print(f'{sitename} positive case is okay')
                 positive = True
@@ -70,7 +70,7 @@ async def check_and_add_maigret_site(site_data, semaphore, logger, ok_usernames,
 
         for bad_username in bad_usernames:
             site_data.username_unclaimed = bad_username
-            status = QueryStatus.AVAILABLE
+            status = MaigretCheckStatus.AVAILABLE
             if await maigret_check(sitename, site_data, bad_username, status, logger):
                 # print(f'{sitename} negative case is okay')
                 negative = True
@@ -181,7 +181,7 @@ if __name__ == '__main__':
     raw_maigret_data = json.dumps({site.name: site.json for site in sites_subset})
 
     new_sites = []
-    for site in tqdm.asyncio.tqdm(urls):
+    for site in alive_progress.alive_it(urls):
         site_lowercase = site.lower()
 
         domain_raw = URL_RE.sub('', site_lowercase).strip().strip('/')
@@ -271,7 +271,9 @@ if __name__ == '__main__':
         future = asyncio.ensure_future(check_coro)
         tasks.append(future)
 
-    for f in tqdm.asyncio.tqdm.as_completed(tasks, timeout=TIMEOUT):
+    with alive_progress(len(tasks), title='Checking sites') as progress:
+        for f in asyncio.as_completed(tasks):
+            progress()
         try:
             loop.run_until_complete(f)
         except asyncio.exceptions.TimeoutError:
